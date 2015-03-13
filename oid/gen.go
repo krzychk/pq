@@ -11,7 +11,7 @@ import (
 	"os"
 	"os/exec"
 
-	_ "github.com/lib/pq"
+	_ "github.com/krzychk/pq"
 )
 
 func main() {
