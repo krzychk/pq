@@ -10,8 +10,16 @@ import (
 	"time"
 )
 
+var errReplicationConnClosed = errors.New("pq: Recplication connection has been closed")
+var errReplicationConnAlreadyReplication = errors.New("pq: Replication connection is in replication state already")
+var errReplicationConnNotReplicating = errors.New("pq: Replication connection is not replicating")
+
 type ReplicationConn struct {
 	cn *conn
+	isOpened bool
+	isReplicating bool
+	msgsChan chan readBuf
+	quitReplicating chan bool
 }
 
 type SystemInfo struct {
@@ -65,7 +73,7 @@ func NewReplicationConn(name string) (*ReplicationConn, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &ReplicationConn{cn: cn.(*conn)}, nil
+	return &ReplicationConn{cn: cn.(*conn), isOpened: true, msgsChan: make(chan readBuf), quitReplicating: make(chan bool)}, nil
 }
 
 func (self *ReplicationConn) StartReplication(slot string, xLogPos string) error {
@@ -74,23 +82,92 @@ func (self *ReplicationConn) StartReplication(slot string, xLogPos string) error
 }
 
 func (self *ReplicationConn) startReplication(q string) error {
-	_, err := self.cn.simpleQuery(q)
+	if self.isReplicating {
+		return errReplicationConnAlreadyReplication
+	}
+
+	b := self.cn.writeBuf('Q')
+	b.string(q)
+	self.cn.send(b)
+	
+	typ, m := self.cn.recv1()
+	if typ != 'W' {
+		return errors.New(fmt.Sprintf("pq: Expected Copy Both mode; got %c, %v", typ, string(*m)))
+	}
+
+	self.isReplicating = true
+
+	go self.recvMessages()
+
+	return nil
+}
+
+func (self *ReplicationConn) recvMessages() {
+	var r readBuf
+	recvMessagesLoop:
+	for {
+		typ, err := self.cn.recvMessage(&r)
+		if err != nil {
+			break
+		}
+
+		switch typ {
+		case 'C':
+		case 'd':
+			go func() {
+				self.msgsChan <-r
+			}()
+		case 'Z', 'c':
+			if self.isReplicating {
+				self.isReplicating = false
+			} else {
+				break recvMessagesLoop
+			}
+		case 'E':
+		}
+	}
+	self.isReplicating = false
+	self.quitReplicating <-true
+}
+
+func (self *ReplicationConn) StopReplication() error {
+	if !self.isReplicating {
+		return errReplicationConnNotReplicating
+	}
+
+	err := self.cn.sendSimpleMessage('c')
 	if err != nil {
 		return err
 	}
-	typ, _ := self.cn.recv1()
-	if typ != 'W' {
-		return errors.New("pq: Expected Copy Both mode")
+
+	<-self.quitReplicating
+	return nil
+}
+
+func (self *ReplicationConn) Close() error {
+	if !self.isOpened {
+		return errReplicationConnClosed
 	}
+
+	self.cn.Close()
+	self.isOpened = false
+
 	return nil
 }
 
 func (self *ReplicationConn) IdentifySystem() (*SystemInfo, error) {
+	if !self.isOpened {
+		return nil, errReplicationConnClosed
+	}
+
 	rows, err := self.cn.simpleQuery("IDENTIFY_SYSTEM")
 	if err != nil {
 		return nil, err
 	}
+	defer rows.Close()
+
 	values := make([]driver.Value, 4)
+
 	err = rows.Next(values)
 	if err != nil {
 		return nil, err
@@ -115,18 +192,20 @@ func (self *ReplicationConn) CreateLogicalReplicationSlot(name string, outputPlu
 }
 
 func (self *ReplicationConn) createReplicationSlot(q string) error {
-	_, err := self.cn.simpleQuery(q)
+	rows, err := self.cn.simpleQuery(q)
 	if err != nil {
 		return err
 	}
+	rows.Close()
 	return nil
 }
 
 func (self *ReplicationConn) DropReplicationSlot(name string) error {
-	_, err := self.cn.simpleQuery(fmt.Sprintf("DROP_REPLICATION_SLOT %s", name))
+	rows, err := self.cn.simpleQuery(fmt.Sprintf("DROP_REPLICATION_SLOT %s", name))
 	if err != nil {
 		return err
 	}
+	rows.Close()
 	return nil
 }
 
@@ -151,15 +230,12 @@ func (self *ReplicationConn) SendMessage(msg *ReplicationMsg) error {
 }
 
 func (self *ReplicationConn) RecvMessage() (*ReplicationMsg, error) {
-	typ, buf := self.cn.recv1()
-	if typ != 'd' {
-		return nil, errors.New("pq: Expected COPY message, got " + string(typ) + "with " + string(*buf))
-	}
-	switch (*buf)[0] {
+	buf := <-self.msgsChan
+	switch (buf)[0] {
 	case MSG_X_LOG_DATA:
-		return newXLogDataMsg(buf), nil
+		return newXLogDataMsg(&buf), nil
 	case MSG_KEEPALIVE:
-		return newKeepaliveMsg(buf), nil
+		return newKeepaliveMsg(&buf), nil
 	default:
 		return nil, errors.New("pq: Unknown replication message")
 	}
