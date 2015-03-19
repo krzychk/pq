@@ -11,14 +11,14 @@ import (
 )
 
 var errReplicationConnClosed = errors.New("pq: Recplication connection has been closed")
-var errReplicationConnAlreadyReplication = errors.New("pq: Replication connection is in replication state already")
+var errReplicationConnReplicating = errors.New("pq: Replication connection is in replication state")
 var errReplicationConnNotReplicating = errors.New("pq: Replication connection is not replicating")
 
 type ReplicationConn struct {
 	cn *conn
 	isOpened bool
 	isReplicating bool
-	msgsChan chan readBuf
+	msgsChan chan *ReplicationMsg
 	quitReplicating chan bool
 }
 
@@ -34,6 +34,7 @@ const (
 	MSG_KEEPALIVE            byte = 'k'
 	MSG_STATUS_UPDATE        byte = 'r'
 	MSG_HOT_STANDBY_FEEDBACK byte = 'h'
+
 )
 
 type ReplicationMsg struct {
@@ -73,17 +74,36 @@ func NewReplicationConn(name string) (*ReplicationConn, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &ReplicationConn{cn: cn.(*conn), isOpened: true, msgsChan: make(chan readBuf), quitReplicating: make(chan bool)}, nil
+	return &ReplicationConn{
+		cn: cn.(*conn), 
+		isOpened: true, 
+		msgsChan: make(chan *ReplicationMsg, 256), 
+		quitReplicating: make(chan bool),
+	}, nil
 }
 
-func (self *ReplicationConn) StartReplication(slot string, xLogPos string) error {
+func (self *ReplicationConn) StartLogicalReplication(slot string, xLogPos string) error {
 	q := fmt.Sprintf("START_REPLICATION SLOT %s LOGICAL %s", slot, xLogPos)
 	return self.startReplication(q)
 }
 
+func (self *ReplicationConn) StartPhysicalReplication(slot string, xLogPos string, timeline int64) error {
+	var timelinePart string
+	if timeline > 0 {
+		timelinePart = fmt.Sprintf(" TIMELINE %d", timeline)
+	} else {
+		timelinePart = ""
+	}
+	q := fmt.Sprintf("START_REPLICATION SLOT %s PHYSICAL %s%s", slot, xLogPos, timelinePart)
+	return self.startReplication(q)
+}
+
 func (self *ReplicationConn) startReplication(q string) error {
+	if !self.isOpened {
+		return errReplicationConnClosed
+	}
 	if self.isReplicating {
-		return errReplicationConnAlreadyReplication
+		return errReplicationConnReplicating
 	}
 
 	b := self.cn.writeBuf('Q')
@@ -103,20 +123,18 @@ func (self *ReplicationConn) startReplication(q string) error {
 }
 
 func (self *ReplicationConn) recvMessages() {
-	var r readBuf
+	r := &readBuf{}
 	recvMessagesLoop:
 	for {
-		typ, err := self.cn.recvMessage(&r)
+		typ, err := self.cn.recvMessage(r)
 		if err != nil {
-			break
+			break recvMessagesLoop
 		}
-
 		switch typ {
 		case 'C':
 		case 'd':
-			go func() {
-				self.msgsChan <-r
-			}()
+			msg := parseMessage(r)
+			self.msgsChan <-msg
 		case 'Z', 'c':
 			if self.isReplicating {
 				self.isReplicating = false
@@ -124,10 +142,18 @@ func (self *ReplicationConn) recvMessages() {
 				break recvMessagesLoop
 			}
 		case 'E':
+			break recvMessagesLoop
 		}
 	}
 	self.isReplicating = false
-	self.quitReplicating <-true
+	select {
+	case self.quitReplicating <-true:
+	default:
+	}
+	select {
+	case self.msgsChan <-nil:
+	default:
+	}
 }
 
 func (self *ReplicationConn) StopReplication() error {
@@ -158,6 +184,9 @@ func (self *ReplicationConn) Close() error {
 func (self *ReplicationConn) IdentifySystem() (*SystemInfo, error) {
 	if !self.isOpened {
 		return nil, errReplicationConnClosed
+	}
+	if self.isReplicating {
+		return nil, errReplicationConnReplicating
 	}
 
 	rows, err := self.cn.simpleQuery("IDENTIFY_SYSTEM")
@@ -192,6 +221,12 @@ func (self *ReplicationConn) CreateLogicalReplicationSlot(name string, outputPlu
 }
 
 func (self *ReplicationConn) createReplicationSlot(q string) error {
+	if !self.isOpened {
+		return errReplicationConnClosed
+	}
+	if self.isReplicating {
+		return errReplicationConnReplicating
+	}
 	rows, err := self.cn.simpleQuery(q)
 	if err != nil {
 		return err
@@ -201,6 +236,12 @@ func (self *ReplicationConn) createReplicationSlot(q string) error {
 }
 
 func (self *ReplicationConn) DropReplicationSlot(name string) error {
+	if !self.isOpened {
+		return errReplicationConnClosed
+	}
+	if self.isReplicating {
+		return errReplicationConnReplicating
+	}
 	rows, err := self.cn.simpleQuery(fmt.Sprintf("DROP_REPLICATION_SLOT %s", name))
 	if err != nil {
 		return err
@@ -217,6 +258,9 @@ func (self *ReplicationConn) writeCopyData(data []byte) error {
 }
 
 func (self *ReplicationConn) SendMessage(msg *ReplicationMsg) error {
+	if !self.isReplicating {
+		return errReplicationConnNotReplicating
+	}
 	buffer := new(bytes.Buffer)
 	err := binary.Write(buffer, binary.BigEndian, msg.Type)
 	if err != nil {
@@ -230,15 +274,24 @@ func (self *ReplicationConn) SendMessage(msg *ReplicationMsg) error {
 }
 
 func (self *ReplicationConn) RecvMessage() (*ReplicationMsg, error) {
-	buf := <-self.msgsChan
-	switch (buf)[0] {
-	case MSG_X_LOG_DATA:
-		return newXLogDataMsg(&buf), nil
-	case MSG_KEEPALIVE:
-		return newKeepaliveMsg(&buf), nil
-	default:
-		return nil, errors.New("pq: Unknown replication message")
+	if !self.isReplicating {
+		return nil, errReplicationConnNotReplicating
 	}
+	msg := <-self.msgsChan
+	if msg == nil {
+		return nil, errReplicationConnNotReplicating
+	}
+	return msg, nil
+}
+
+func parseMessage(buf *readBuf) *ReplicationMsg {
+	switch (*buf)[0] {
+	case MSG_X_LOG_DATA:
+		return newXLogDataMsg(buf)
+	case MSG_KEEPALIVE:
+		return newKeepaliveMsg(buf)
+	}
+	panic(fmt.Sprintf("Unknown message type: %c", (*buf)[0]))
 }
 
 func XLogPosIntToStr(xLogPos int64) string {

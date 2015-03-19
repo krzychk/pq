@@ -124,7 +124,7 @@ func startReplication(t *testing.T, r *ReplicationConn) string {
     t.Fatal(err)
   }
 
-  err = r.StartReplication(replicationSlot, systemInfo.XLogPos)
+  err = r.StartLogicalReplication(replicationSlot, systemInfo.XLogPos)
   if err != nil {
     t.Fatal(err)
   }
@@ -185,15 +185,15 @@ func TestStartReplication(t *testing.T) {
     t.Fatal(err)
   }
 
-  err = r.StartReplication(replicationSlot, systemInfo.XLogPos)
+  err = r.StartLogicalReplication(replicationSlot, systemInfo.XLogPos)
   if err != nil {
     t.Fatal(err)
   }
   defer r.StopReplication()
 
-  err = r.StartReplication(replicationSlot, systemInfo.XLogPos)
-  if err != errReplicationConnAlreadyReplication {
-    t.Fatalf("expected errReplicationConnAlreadyReplication; got %v", err)
+  err = r.StartLogicalReplication(replicationSlot, systemInfo.XLogPos)
+  if err != errReplicationConnReplicating {
+    t.Fatalf("expected errReplicationConnReplicating; got %v", err)
   }
 
   err = r.StopReplication()
@@ -246,5 +246,71 @@ func TestReplicationMessages(t *testing.T) {
 
   if msg.CurrentXLogPos <= XLogPosStrToInt(xLogPos) {
     t.Fatal("Non linear position received")
+  }
+}
+
+func TestConnectionDroppingBehaviour(t *testing.T) {
+  r := newTestReplicationConn(t)
+  defer r.Close()
+
+  createTestReplicationSlot(t, r)
+  defer dropTestReplicationSlot(t, r)
+
+  startReplication(t, r)
+  defer r.StopReplication()
+
+  receivedError := make(chan error)
+  timeout := make(chan bool)
+
+  go func(){
+    time.Sleep(2 * time.Second)
+    timeout <-true
+  }()
+
+  go func(){
+    for {
+      _, err := r.RecvMessage()
+      if err != nil {
+        receivedError <-err
+        return
+      }
+    }
+  }()
+
+  r.StopReplication()
+  
+  select {
+  case <-timeout:
+    t.Fatal("Timouted")
+  case err := <-receivedError:
+    if err != errReplicationConnNotReplicating {
+      t.Fatalf("expected errReplicationConnNotReplicating; got %v", err)
+    }
+  }
+}
+
+func TestPreventCommandsInReplicationMode(t *testing.T) {
+  r := newTestReplicationConn(t)
+  defer r.Close()
+
+  createTestReplicationSlot(t, r)
+  defer dropTestReplicationSlot(t, r)
+
+  startReplication(t, r)
+  defer r.StopReplication()
+
+  _, err := r.IdentifySystem()
+  if err != errReplicationConnReplicating {
+    t.Fatalf("expected errReplicationConnReplicating; got %v", err)
+  }
+
+  err = r.CreatePhysicalReplicationSlot("slot_name")
+  if err != errReplicationConnReplicating {
+    t.Fatalf("expected errReplicationConnReplicating; got %v", err)
+  }
+
+  err = r.DropReplicationSlot("slot_name")
+  if err != errReplicationConnReplicating {
+    t.Fatalf("expected errReplicationConnReplicating; got %v", err)
   }
 }
