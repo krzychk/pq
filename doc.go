@@ -206,5 +206,14 @@ bytes by the PostgreSQL server.
 You can find a complete, working example of Listener usage at
 http://godoc.org/github.com/lib/pq/listen_example.
 
+
+Replication
+
+Since x.x.x PostgreSQL supports ...
+
+To establish database connection in walsender mode, you have to use 
+pq.ReplictionConn. 
+
+
 */
 package pq
