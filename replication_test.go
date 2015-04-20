@@ -289,32 +289,6 @@ func TestConnectionDroppingBehaviour(t *testing.T) {
   }
 }
 
-func TestMessageBuffering(t *testing.T) {
-  db := openTestConnWithTable(t)
-  defer closeTestConnWithTable(t, db)
-
-  r := newTestReplicationConn(t)
-  defer r.Close()
-
-  createTestReplicationSlot(t, r)
-  defer dropTestReplicationSlot(t, r)
-
-  xLogPos := startReplication(t, r)
-  defer r.StopReplication()
-
-  expectValidStatusUpdateSend(t, r, xLogPos, false)
-
-  db.Exec("INSERT INTO repl VALUES (1)")
-
-  r.StopReplication()
-
-  msg := expectXLogDataMsgReceived(t, r)
-
-  if msg.CurrentXLogPos <= XLogPosStrToInt(xLogPos) {
-    t.Fatal("Non linear position received")
-  }
-}
-
 func TestPreventCommandsInReplicationMode(t *testing.T) {
   r := newTestReplicationConn(t)
   defer r.Close()

@@ -14,6 +14,7 @@ var (
 	errReplicationConnClosed = errors.New("pq: Recplication connection has been closed")
 	errReplicationConnReplicating = errors.New("pq: Replication connection is in replication state")
 	errReplicationConnNotReplicating = errors.New("pq: Replication connection is not replicating")
+	errStopReplicationTimeout = errors.New("pg: StopReplication timed out")
 )
 
 // ReplicationConn represents PostgreSQL connection in walsender mode.
@@ -23,6 +24,7 @@ type ReplicationConn struct {
 	isReplicating bool
 	msgsChan chan *ReplicationMsg
 	quitReplicating chan bool
+	closeRepl chan struct{}
 }
 
 // PostgreSQL response to IDENTIFY_SYSTEM walsender command.
@@ -125,7 +127,7 @@ func NewReplicationConn(connectionString string) (*ReplicationConn, error) {
 	return &ReplicationConn{
 		cn: cn.(*conn), 
 		isOpened: true, 
-		msgsChan: make(chan *ReplicationMsg, 256), 
+		msgsChan: make(chan *ReplicationMsg), 
 		quitReplicating: make(chan bool),
 	}, nil
 }
@@ -170,6 +172,7 @@ func (self *ReplicationConn) startReplication(q string) error {
 	}
 
 	self.isReplicating = true
+	self.closeRepl = make(chan struct{})
 
 	go self.recvMessages()
 
@@ -188,7 +191,18 @@ func (self *ReplicationConn) recvMessages() {
 		case 'C':
 		case 'd':
 			msg := parseMessage(r)
-			self.msgsChan <-msg
+			select {
+			case self.msgsChan <-msg:
+			case <-self.closeRepl: //Close replication message sent, but no reader on msgsChan -> drain msgsChan
+				go func(){
+					for {
+						msg := <-self.msgsChan
+						if msg == nil {
+							return
+						}
+					}
+				}()
+			}
 		case 'Z', 'c':
 			if self.isReplicating {
 				self.isReplicating = false
@@ -221,8 +235,13 @@ func (self *ReplicationConn) StopReplication() error {
 	if err != nil {
 		return err
 	}
-
-	<-self.quitReplicating
+	select {
+	case <-self.quitReplicating:
+	case <-time.After(time.Second):
+		close(self.closeRepl)
+		<-self.quitReplicating
+		return errStopReplicationTimeout
+	}
 	return nil
 }
 
